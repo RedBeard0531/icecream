@@ -263,19 +263,29 @@ static float server_speed(CompileServer *cs, Job *job)
                    it is assumed the submitter is doing a massively parallel build, in which case it is
                    better not to build on the submitter and let it do other work (such as preprocessing
                    output for other nodes) that can be done only locally.  */
-                if (cs->submittedJobsCount() <= cs->maxJobs()) {
-                    f *= 1.1;
+                if (cs->submittedJobsCount() <= std::max(4, cs->maxJobs()/2)) {
+                    f *= 2;
                 } else {
-                    f *= 0.1;    // penalize heavily
+                    f /= 100;    // penalize heavily
                 }
             } else { // ignoring load for submitter - assuming the load is our own
                 f *= float(1000 - cs->load()) / 1000;
+
+                // Try not to send jobs to hosts that are busy trying to compile.
+                if (cs->submittedJobsCount() > std::max(1, cs->maxJobs() / 4)) {
+                    f /= 1000;
+                }
             }
         }
 
         // below we add a pessimism factor - assuming the first job a computer got is not representative
         if (cs->lastCompiledJobs().size() < 7) {
             f *= (-0.5 * cs->lastCompiledJobs().size() + 4.5);
+        }
+
+        if (cs->jobList().size() >= size_t(cs->maxJobs() / 2)) {
+            // Penalize nodes > 1/2 full on the assumption that they are hyperthreads.
+            f /= 10;
         }
 
         return f;
@@ -577,7 +587,7 @@ static CompileServer *pick_server(Job *job)
 
     uint matches = 0;
 
-    if (job->submitter()->maxJobs() > int(job->submitter()->jobList().size())) {
+    if (job->submitter()->submittedJobsCount() < (job->submitter()->maxJobs() / 2)) {
         // Prefer running locally if the submitter has capacity to minimize
         // latency when editing and compiling a small number of files.
         return job->submitter();
@@ -644,7 +654,7 @@ static CompileServer *pick_server(Job *job)
             break;
         }
 
-        if (!envs_match(cs, job).empty()) {
+        if (!envs_match(cs, job).empty()) { // Always true for cs == job->submitter()
             if (!best) {
                 best = cs;
             }
@@ -661,6 +671,13 @@ static CompileServer *pick_server(Job *job)
 
             matches++;
         } else {
+            // Try not to send jobs to hosts that currently running other host's jobs.
+            // This is largely an attempt to avoid compile failures due to
+            // https://github.com/icecc/icecream/issues/276.
+            if (!cs->jobList().empty() && cs->jobList().front()->submitter() != job->submitter()) {
+                continue;
+            }
+
             if (!bestui) {
                 bestui = cs;
             }
